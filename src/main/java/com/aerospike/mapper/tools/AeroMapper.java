@@ -1,9 +1,29 @@
 package com.aerospike.mapper.tools;
 
-import com.aerospike.client.*;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.reflect.Array;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
+
+import javax.validation.constraints.NotNull;
+
+import org.apache.commons.lang3.StringUtils;
+
+import com.aerospike.client.AerospikeException;
 import com.aerospike.client.AerospikeException.ScanTerminated;
+import com.aerospike.client.Bin;
+import com.aerospike.client.IAerospikeClient;
+import com.aerospike.client.Key;
+import com.aerospike.client.Log;
+import com.aerospike.client.Operation;
 import com.aerospike.client.Record;
+import com.aerospike.client.Value;
 import com.aerospike.client.policy.BatchPolicy;
+import com.aerospike.client.policy.GenerationPolicy;
 import com.aerospike.client.policy.Policy;
 import com.aerospike.client.policy.QueryPolicy;
 import com.aerospike.client.policy.RecordExistsAction;
@@ -22,17 +42,6 @@ import com.aerospike.mapper.tools.virtuallist.VirtualList;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
-import org.apache.commons.lang3.StringUtils;
-
-import javax.validation.constraints.NotNull;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.lang.reflect.Array;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Function;
 
 public class AeroMapper implements IAeroMapper {
 
@@ -184,6 +193,28 @@ public class AeroMapper implements IAeroMapper {
             return this.mapper;
         }
     }
+    
+    public class Updatable<T> {
+    	private T object;
+    	private int readGeneration;
+    	protected Updatable(T object, int readGeneration) {
+    		this.object = object;
+    		this.readGeneration = readGeneration;
+    	}
+    	
+    	public T get() {
+    		return this.object;
+    	}
+    	
+    	public void update() throws AerospikeException {
+    		this.update((String[])null);
+    	}
+
+    	public void update(String ... bins) throws AerospikeException {
+    		AeroMapper.this.save(null, this.object, RecordExistsAction.UPDATE, bins, this.readGeneration);
+    	}
+    }
+
 
     private AeroMapper(@NotNull IAerospikeClient client) {
         this.mClient = client;
@@ -199,25 +230,34 @@ public class AeroMapper implements IAeroMapper {
 
     @Override
     public void save(@NotNull Object object, String... binNames) throws AerospikeException {
-        save(null, object, RecordExistsAction.REPLACE, binNames);
+        save(null, object, RecordExistsAction.REPLACE, binNames, 0);
     }
 
     @Override
     public void save(@NotNull WritePolicy writePolicy, @NotNull Object object, String... binNames) throws AerospikeException {
-        save(writePolicy, object, null, binNames);
+        save(writePolicy, object, null, binNames, 0);
     }
 
     @SuppressWarnings("unchecked")
-    private <T> void save(WritePolicy writePolicy, @NotNull T object, RecordExistsAction recordExistsAction, String[] binNames) {
+    private <T> void save(WritePolicy writePolicy, @NotNull T object, RecordExistsAction recordExistsAction, String[] binNames, int readGeneration) {
         Class<T> clazz = (Class<T>) object.getClass();
         ClassCacheEntry<T> entry = MapperUtils.getEntryAndValidateNamespace(clazz, this);
+        boolean isClonedPolicy = false;
         if (writePolicy == null) {
             writePolicy = new WritePolicy(entry.getWritePolicy());
+            isClonedPolicy = true;
             if (recordExistsAction != null) {
                 writePolicy.recordExistsAction = recordExistsAction;
             }
         }
 
+        if (readGeneration != 0) {
+        	if (!isClonedPolicy) {
+                writePolicy = new WritePolicy(entry.getWritePolicy());
+        	}
+        	writePolicy.generationPolicy = GenerationPolicy.EXPECT_GEN_EQUAL;
+        	writePolicy.generation = readGeneration;
+        }
         String set = entry.getSetName();
         if ("".equals(set)) {
             // Use the null set
@@ -241,7 +281,7 @@ public class AeroMapper implements IAeroMapper {
 
     @Override
     public void update(@NotNull Object object, String... binNames) throws AerospikeException {
-        save(null, object, RecordExistsAction.UPDATE, binNames);
+        save(null, object, RecordExistsAction.UPDATE, binNames, 0);
     }
 
     @Override
@@ -253,7 +293,7 @@ public class AeroMapper implements IAeroMapper {
     public <T> T readFromDigest(@NotNull Class<T> clazz, @NotNull byte[] digest, boolean resolveDependencies) throws AerospikeException {
         ClassCacheEntry<T> entry = MapperUtils.getEntryAndValidateNamespace(clazz, this);
         Key key = new Key(entry.getNamespace(), digest, entry.getSetName(), null);
-        return this.read(null, clazz, key, entry, resolveDependencies);
+        return this.read(null, clazz, key, entry, resolveDependencies).get();
     }
 
     @Override
@@ -265,7 +305,7 @@ public class AeroMapper implements IAeroMapper {
     public <T> T readFromDigest(Policy readPolicy, @NotNull Class<T> clazz, @NotNull byte[] digest, boolean resolveDependencies) throws AerospikeException {
         ClassCacheEntry<T> entry = MapperUtils.getEntryAndValidateNamespace(clazz, this);
         Key key = new Key(entry.getNamespace(), digest, entry.getSetName(), null);
-        return this.read(readPolicy, clazz, key, entry, resolveDependencies);
+        return this.read(readPolicy, clazz, key, entry, resolveDependencies).get();
     }
 
     @Override
@@ -274,11 +314,23 @@ public class AeroMapper implements IAeroMapper {
     }
 
     @Override
+    public <T> Updatable<T> readForUpdate(@NotNull Class<T> clazz, @NotNull Object userKey) throws AerospikeException {
+		return readForUpdate(clazz, userKey, true);
+	}
+
+    private <T> Updatable<T> readForUpdate(@NotNull Class<T> clazz, @NotNull Object userKey, boolean resolveDependencies) throws AerospikeException {
+		ClassCacheEntry<T> entry = MapperUtils.getEntryAndValidateNamespace(clazz, this);
+		String set = entry.getSetName();
+		Key key = new Key(entry.getNamespace(), set, Value.get(entry.translateKeyToAerospikeKey(userKey)));
+		return read(null, clazz, key, entry, resolveDependencies);
+    }
+    
+    @Override
     public <T> T read(@NotNull Class<T> clazz, @NotNull Object userKey, boolean resolveDependencies) throws AerospikeException {
         ClassCacheEntry<T> entry = MapperUtils.getEntryAndValidateNamespace(clazz, this);
         String set = entry.getSetName();
         Key key = new Key(entry.getNamespace(), set, Value.get(entry.translateKeyToAerospikeKey(userKey)));
-        return read(null, clazz, key, entry, resolveDependencies);
+        return read(null, clazz, key, entry, resolveDependencies).get();
     }
 
     @Override
@@ -291,7 +343,7 @@ public class AeroMapper implements IAeroMapper {
         ClassCacheEntry<T> entry = MapperUtils.getEntryAndValidateNamespace(clazz, this);
         String set = entry.getSetName();
         Key key = new Key(entry.getNamespace(), set, Value.get(entry.translateKeyToAerospikeKey(userKey)));
-        return read(readPolicy, clazz, key, entry, resolveDependencies);
+        return read(readPolicy, clazz, key, entry, resolveDependencies).get();
     }
 
     @Override
@@ -326,11 +378,11 @@ public class AeroMapper implements IAeroMapper {
     }
 
     @SuppressWarnings({"unchecked"})
-    private <T> T read(Policy readPolicy, @NotNull Class<T> clazz, @NotNull Key key, @NotNull ClassCacheEntry<T> entry, boolean resolveDependencies) {
+    private <T> Updatable<T> read(Policy readPolicy, @NotNull Class<T> clazz, @NotNull Key key, @NotNull ClassCacheEntry<T> entry, boolean resolveDependencies) {
         if (readPolicy == null || readPolicy.filterExp == null) {
             Object objectForKey = LoadedObjectResolver.get(key);
             if (objectForKey != null) {
-                return (T) objectForKey;
+                return new Updatable<T>((T) objectForKey, 0);
             }
         }
         if (readPolicy == null) {
@@ -344,7 +396,7 @@ public class AeroMapper implements IAeroMapper {
             try {
                 ThreadLocalKeySaver.save(key);
                 LoadedObjectResolver.begin();
-                return mappingConverter.convertToObject(clazz, record, entry, resolveDependencies);
+                return new Updatable<T>(mappingConverter.convertToObject(clazz, record, entry, resolveDependencies), record.generation);
             } catch (ReflectiveOperationException e) {
                 throw new AerospikeException(e);
             } finally {

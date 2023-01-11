@@ -14,6 +14,7 @@ import com.aerospike.client.policy.QueryPolicy;
 import com.aerospike.client.policy.ScanPolicy;
 import com.aerospike.client.policy.WritePolicy;
 import com.aerospike.client.query.Filter;
+import com.aerospike.mapper.tools.AeroMapper.Updatable;
 import com.aerospike.mapper.tools.virtuallist.VirtualList;
 
 public interface IAeroMapper extends IBaseAeroMapper {
@@ -92,6 +93,20 @@ public interface IAeroMapper extends IBaseAeroMapper {
      * This method should not be used: It is used by mappers to correctly resolved dependencies.
      */
     <T> T readFromDigest(Policy readPolicy, @NotNull Class<T> clazz, @NotNull byte[] digest, boolean resolveDependencies);
+
+    /**
+     * Read a record from the repository and map it to an instance of the passed class. The result can be updated and a generation
+     * check performed, ensuring that no change has been made to the record between the read and the update.
+     * <p/>
+     * Note: In SQL, <code>selectForUpdate</code> is normally used to do pessimistic locking on the object. However, Aerospike only
+     * supports optimistic locking so this method uses optimistic locking.
+     *
+     * @param clazz   - The type of be returned.
+     * @param userKey - The key of the record. The namespace and set will be derived from the values specified on the passed class.
+     * @return The returned mapped record.
+     * @throws AerospikeException an AerospikeException will be thrown in case of an error.
+     */
+    <T> Updatable<T> readForUpdate(@NotNull Class<T> clazz, @NotNull Object userKey);
 
     /**
      * Read a record from the repository and map it to an instance of the passed class.
